@@ -10,6 +10,7 @@ import shutil
 import re
 import base64
 import socket
+import ssl
 import subprocess
 import platform
 import uuid
@@ -489,6 +490,316 @@ def probe_outbounds(items, timeout=3.0, threads=4, on_progress=None):
     return results
 
 
+# ============================================================
+# 出口 IP 检测
+# ============================================================
+# 这里要分清两件事，它们经常被混为一谈：
+#   入口（优选 IP）—— 客户端从哪个 CDN 边缘接入，只影响这一段的速度和可达性
+#   出口（本模块查的）—— 流量最终从哪个 IP 出去，由 sing-box 的出站决定
+#
+# 本项目的 sing-box 跑在 Streamlit 容器里，隧道是容器主动往外连的，
+# 所以直连模式下出口恒等于容器所在地 —— 客户端连香港还是美国节点都不改变这一点。
+# CFNext 之所以「选哪个地区就出哪个地区」，是因为它的代理代码跑在 Cloudflare 边缘上。
+
+SOCKS5_REPLY_ERRORS = {
+    0x01: "通用失败",
+    0x02: "规则不允许连接",
+    0x03: "网络不可达",
+    0x04: "主机不可达",
+    0x05: "目标拒绝连接",
+    0x06: "TTL 超时",
+    0x07: "不支持的命令",
+    0x08: "不支持的地址类型",
+}
+
+
+def _socks5_negotiate(sock, username, password, dest_host, dest_port):
+    """在一条已连上的 socket 上完成 SOCKS5 认证并 CONNECT 到目标。失败抛 OSError。
+
+    和 socks5_handshake 的区别：那个只验到「认证通过」就收工，
+    这个要真的把 CONNECT 发出去，好让调用方接着在隧道里跑流量。
+    """
+    if username:
+        sock.sendall(b"\x05\x02\x00\x02")          # 无认证 + 用户名密码
+    else:
+        sock.sendall(b"\x05\x01\x00")              # 只要无认证
+
+    resp = _recv_exact(sock, 2)
+    if not resp or resp[0] != 0x05:
+        raise OSError("对端不是 SOCKS5 代理")
+    method = resp[1]
+
+    if method == 0x02:
+        user = username.encode("utf-8")
+        pwd = password.encode("utf-8")
+        if len(user) > 255 or len(pwd) > 255:
+            raise OSError("账号或密码超过 255 字节")
+        sock.sendall(b"\x01" + bytes([len(user)]) + user
+                     + bytes([len(pwd)]) + pwd)
+        auth = _recv_exact(sock, 2)
+        if not auth or auth[1] != 0x00:
+            raise OSError("SOCKS5 认证被拒绝")
+    elif method != 0x00:
+        raise OSError(f"代理要求不支持的认证方式 0x{method:02x}")
+
+    # 目标地址按类型打包：IPv4 / IPv6 / 域名
+    try:
+        addr = b"\x01" + socket.inet_aton(dest_host)
+    except OSError:
+        try:
+            addr = b"\x04" + socket.inet_pton(socket.AF_INET6, dest_host)
+        except OSError:
+            try:
+                hb = dest_host.encode("idna")
+            except UnicodeError:
+                raise OSError(f"域名无法编码：{dest_host}")
+            if len(hb) > 255:
+                raise OSError("域名超过 255 字节")
+            addr = b"\x03" + bytes([len(hb)]) + hb
+
+    sock.sendall(b"\x05\x01\x00" + addr
+                 + bytes([(dest_port >> 8) & 0xFF, dest_port & 0xFF]))
+
+    rep = _recv_exact(sock, 4)
+    if not rep:
+        raise OSError("代理没有返回 CONNECT 结果")
+    if rep[1] != 0x00:
+        raise OSError("SOCKS5 " + SOCKS5_REPLY_ERRORS.get(rep[1], f"错误码 0x{rep[1]:02x}"))
+
+    # 吃掉绑定地址 + 端口，不回读的话后面第一个字节会被它们污染
+    atyp = rep[3]
+    if atyp == 0x01:
+        _recv_exact(sock, 4)
+    elif atyp == 0x04:
+        _recv_exact(sock, 16)
+    elif atyp == 0x03:
+        ln = _recv_exact(sock, 1)
+        _recv_exact(sock, ln[0] if ln else 0)
+    _recv_exact(sock, 2)
+
+
+def _http_connect_negotiate(sock, dest_host, dest_port):
+    """在一条已连上的 socket 上发 HTTP CONNECT 建隧道。失败抛 OSError。"""
+    req = (f"CONNECT {dest_host}:{dest_port} HTTP/1.1\r\n"
+           f"Host: {dest_host}:{dest_port}\r\n\r\n")
+    sock.sendall(req.encode("ascii"))
+
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(1024)
+        if not chunk:
+            raise OSError("HTTP 代理提前断开")
+        buf += chunk
+        if len(buf) > 8192:
+            raise OSError("HTTP 代理响应异常")
+    # CONNECT 的 200 响应没有 body，所以不会有多读出来的隧道数据
+    status = buf.split(b"\r\n", 1)[0].decode("latin-1")
+    if " 200" not in status:
+        raise OSError(f"HTTP 代理拒绝 CONNECT：{status.strip()}")
+
+
+def _dial_through(chain, dest_host, dest_port, timeout=8.0):
+    """沿 chain 逐级建隧道，返回一条连到目标的 socket。
+
+    chain 里每项都是一个已解析的出站节点（hop1 在前、hop2 在后）。
+    逐级 CONNECT 嵌套 —— 和 sing-box 里 hop2 用 detour 挂 hop1 的语义一致：
+    容器 -> hop1 -> hop2 -> 目标。
+
+    chain 为空时就是直连。
+    """
+    if not chain:
+        sock = socket.create_connection((dest_host, dest_port), timeout=timeout)
+        sock.settimeout(timeout)
+        return sock
+
+    head = chain[0]
+    sock = socket.create_connection((head["server"], head["server_port"]), timeout=timeout)
+    sock.settimeout(timeout)
+    try:
+        for i, hop in enumerate(chain):
+            nxt = chain[i + 1] if i + 1 < len(chain) else None
+            target_host, target_port = (nxt["server"], nxt["server_port"]) if nxt \
+                else (dest_host, dest_port)
+            if hop["type"] == "http":
+                _http_connect_negotiate(sock, target_host, target_port)
+            else:
+                _socks5_negotiate(sock, hop["username"], hop["password"],
+                                  target_host, target_port)
+        return sock
+    except Exception:
+        try:
+            sock.close()
+        except OSError:
+            pass
+        raise
+
+
+def _dechunk(sock, body):
+    """把 chunked 编码的 body 解出来（body 是已经读到的部分）。"""
+    out = b""
+    while True:
+        while b"\r\n" not in body:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return out
+            body += chunk
+        size_line, body = body.split(b"\r\n", 1)
+        try:
+            size = int(size_line.split(b";")[0].strip() or b"0", 16)
+        except ValueError:
+            raise OSError("chunked 长度字段无法解析")
+        if size == 0:
+            return out
+        while len(body) < size + 2:
+            chunk = sock.recv(4096)
+            if not chunk:
+                return out
+            body += chunk
+        out += body[:size]
+        body = body[size + 2:]
+
+
+def _read_http_body(sock, limit=65536):
+    """从 socket 读一个完整的 HTTP 响应，返回 body 文本。"""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        if len(buf) > limit:
+            raise OSError("响应头过大")
+    if b"\r\n\r\n" not in buf:
+        raise OSError("响应不完整")
+
+    head, body = buf.split(b"\r\n\r\n", 1)
+    head_text = head.decode("latin-1")
+    status = head_text.split("\r\n", 1)[0]
+    if " 200" not in status:
+        raise OSError(f"接口返回 {status.strip()}")
+
+    headers = {}
+    for line in head_text.split("\r\n")[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+
+    if headers.get("transfer-encoding", "").lower() == "chunked":
+        return _dechunk(sock, body).decode("utf-8", "ignore")
+
+    if "content-length" in headers:
+        try:
+            need = int(headers["content-length"])
+        except ValueError:
+            raise OSError("Content-Length 无法解析")
+        while len(body) < need:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            body += chunk
+        return body[:need].decode("utf-8", "ignore")
+
+    # 既没有 Content-Length 也不是 chunked：读到对端关闭为止
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        body += chunk
+        if len(body) > limit:
+            break
+    return body.decode("utf-8", "ignore")
+
+
+def _http_get_json(host, port, use_tls, path, chain, timeout=8.0):
+    """经 chain（可为空 = 直连）发一个 GET，返回解析后的 JSON。"""
+    sock = _dial_through(chain, host, port, timeout)
+    try:
+        if use_tls:
+            # wrap_socket 会接管底层 socket，之后只关外层即可
+            sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+            sock.settimeout(timeout)
+        req = (f"GET {path} HTTP/1.1\r\nHost: {host}\r\n"
+               "User-Agent: Mozilla/5.0\r\nAccept: application/json\r\n"
+               "Connection: close\r\n\r\n")
+        sock.sendall(req.encode("ascii"))
+        text = _read_http_body(sock)
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    return json.loads(text)
+
+
+def _parse_ip_api(payload):
+    """ip-api.com 的返回：{"status":"success","query":"1.2.3.4","countryCode":"US",...}"""
+    if payload.get("status") != "success":
+        raise ValueError(payload.get("message") or "接口返回失败状态")
+    return payload.get("query") or "", payload.get("countryCode") or "", payload.get("country") or ""
+
+
+def _parse_country_is(payload):
+    """api.country.is 的返回：{"ip":"1.2.3.4","country":"US"}"""
+    return payload.get("ip") or "", payload.get("country") or "", ""
+
+
+# 按顺序试，前一个失败就换下一个。
+# 第一个走明文 HTTP —— 不依赖 TLS，能穿过只放行 80 端口的代理；代价是最后一段不加密，
+# 但出口 IP 这种公开信息被中间人篡改没有意义，可靠性比这点隐私重要。
+EXIT_CHECK_APIS = [
+    ("ip-api.com", 80, False, "/json/?fields=status,message,query,country,countryCode",
+     _parse_ip_api),
+    ("api.country.is", 443, True, "/", _parse_country_is),
+]
+
+
+def build_outbound_chain(cfg):
+    """按配置拼出出站链路，返回 [parsed, ...]（hop1 在前、hop2 在后）。
+
+    直连模式返回空列表。只保留能解析的项 —— 和 build_singbox_config 的取舍一致。
+    """
+    if str(cfg.get("outbound_mode")) != MODE_PROXY:
+        return []
+    chain = []
+    for field in ("hop1", "hop2"):
+        parsed = parse_proxy_url(cfg.get(field))
+        if parsed:
+            chain.append(parsed)
+    return chain
+
+
+def _describe_hop(parsed):
+    label = "HTTP 代理" if parsed["type"] == "http" else "SOCKS5"
+    return f"{label} {parsed['server']}:{parsed['server_port']}"
+
+
+def query_exit_ip(cfg, timeout=8.0):
+    """查询当前出站链路的真实出口，返回 (info, error)。
+
+    info = {"ip", "code", "country", "via"}，country 已转成中文。
+    """
+    chain = build_outbound_chain(cfg)
+    via = " → ".join(_describe_hop(p) for p in chain) if chain else "直连（容器出口）"
+
+    errors = []
+    for host, port, use_tls, path, parser in EXIT_CHECK_APIS:
+        try:
+            payload = _http_get_json(host, port, use_tls, path, chain, timeout)
+            ip, code, country = parser(payload)
+            if not ip:
+                raise ValueError("接口没返回 IP")
+            code = (code or "").upper()
+            return {
+                "ip": ip,
+                "code": code,
+                "country": REGION_CN.get(code) or country or code or "未知",
+                "via": via,
+            }, ""
+        except Exception as e:
+            errors.append(f"{host}: {type(e).__name__}: {e}")
+    return None, "；".join(errors)
+
+
 def _is_region_stopword(seg):
     """判断一个中文段是不是源的固定前缀词，而不是地区名。
 
@@ -900,6 +1211,8 @@ KEY_PENDING_ADD = "_pending_add_ips"
 # 单独放一个键是因为 set_flash 是覆盖式的：render_region_sources 和
 # apply_pending_preferred_ips 都会写提示，后写的会把前一个顶掉。
 KEY_PENDING_NOTE = "_pending_add_note"
+# 出口检测结果。存下来是为了 rerun 之后还能看到，不用反复点检测。
+KEY_EXIT_RESULT = "_exit_check_result"
 
 
 def apply_pending_preferred_ips(secrets_cfg):
@@ -1224,6 +1537,59 @@ def render_outbound_test(cfg):
                          "对方防火墙有没有放行你的来源 IP。")
 
 
+def render_exit_check(cfg):
+    """出口 IP 检测：查流量最终从哪个 IP 出去。
+
+    必须放在 st.form 之外（按钮要独立响应）。
+    """
+    with st.expander("🔍 出口 IP 检测", expanded=False):
+        st.caption("这里查的是**流量最终从哪个 IP 出去**。"
+                   "它和你在「地区优选源」里选的入口节点在哪个国家**没有关系** —— "
+                   "入口只决定客户端从哪个 CDN 边缘接入，出口由 sing-box 的出站决定。")
+
+        entries = []
+        for line in cfg.get("preferred_ips") or []:
+            parsed = parse_target_line(line)
+            if parsed and parsed[2]:
+                entries.append(parsed[2])
+        if entries:
+            shown = "、".join(entries[:8]) + ("…" if len(entries) > 8 else "")
+            st.caption(f"当前优选列表里的入口节点：{shown}（这些是入口，不是出口）")
+
+        if st.button("检测当前出口", key="check_exit"):
+            with st.spinner("查询中…"):
+                info, err = query_exit_ip(cfg)
+            st.session_state[KEY_EXIT_RESULT] = (info, err)
+
+        result = st.session_state.get(KEY_EXIT_RESULT)
+        if not result:
+            st.info("还没检测过。点上面的按钮查一次。")
+            return
+
+        info, err = result
+        if err:
+            st.error(f"检测失败：{err}")
+            st.caption("两个查询接口都试过了。代理只放行特定端口、或者网络本身出不去，"
+                       "都会失败 —— 这本身也是个有用的信号。")
+            return
+
+        c1, c2 = st.columns(2)
+        c1.metric("出口 IP", info["ip"])
+        c2.metric("归属地区", f"{info['country']}（{info['code']}）"
+                  if info["code"] else info["country"])
+
+        chain = build_outbound_chain(cfg)
+        if chain:
+            st.caption("链路：容器 → " + " → ".join(_describe_hop(p) for p in chain) + " → 目标")
+            st.success("当前走代理链路，出口由落地节点决定。")
+        else:
+            st.caption("链路：容器 → 直连 → 目标")
+            st.warning("当前是直连模式，出口就是容器的 IP。"
+                       "换入口节点（香港 / 日本 / 美国…）不会改变它。"
+                       "要换出口国家，去「落地与出站」把出站模式改成「走代理链路」，"
+                       "并在落地节点里填目标国家的代理。")
+
+
 def render_main_ui(secrets_cfg):
     """渲染主控制面板。"""
     st.set_page_config(page_title="部署工具", layout="wide")
@@ -1375,6 +1741,9 @@ def render_main_ui(secrets_cfg):
 
     # ---------- 出站链路测试（同样必须在 st.form 之外）----------
     render_outbound_test(cfg)
+
+    # ---------- 出口 IP 检测（同样必须在 st.form 之外）----------
+    render_exit_check(cfg)
 
     # ---------- 配置备份 ----------
     st.subheader("配置备份")
