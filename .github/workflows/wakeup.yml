@@ -1,0 +1,38 @@
+name: Wake Up Streamlit App (Advanced Browser Simulation)
+
+on:
+  schedule:
+    # 每15分钟运行一次
+   #- cron: '*/15 * * * *'
+   # 每8个小时运行一次 (在 0:00, 8:00, 16:00 触发)
+   - cron: '0 */8 * * *'
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  wake_up:
+    runs-on: ubuntu-latest
+    steps:
+      # 第一步：下载你的代码，这样我们才能运行 wakeup_script.py
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 第二步：设置Python环境
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      # 第三步：安装 Playwright 库
+      - name: Install Playwright Python library
+        run: pip install playwright
+
+      # 第四步：安装 Playwright 需要的浏览器核心文件 (非常关键！)
+      - name: Install browser binaries
+        run: playwright install --with-deps
+
+      # 第五步：运行我们的唤醒脚本
+      - name: Run wakeup script using a real browser
+        # #############################################################
+        # ## 请务必将下面的 URL 替换成您自己的 Streamlit 应用 URL！ ##
+        # #############################################################
+        run: python wakeup_script.py "https://your-app.streamlit.app"

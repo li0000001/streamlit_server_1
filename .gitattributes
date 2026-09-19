@@ -1,0 +1,8 @@
+# 统一按 LF 存进仓库、按 LF 检出 —— 项目最终跑在 Linux（Streamlit Cloud）上。
+# 不固定的话，Windows 上 core.autocrlf=true 会让每次检出都把行尾改成 CRLF，
+# 之后随便改一行都会显示成「整个文件都变了」。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.zip binary

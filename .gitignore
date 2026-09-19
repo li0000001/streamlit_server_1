@@ -1,0 +1,21 @@
+# 运行时产物
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 备份文件（改造前的旧版 app.py，只留在本地）
+app.py.bak-*
+*.bak
+
+# 本地配置与凭据 —— 绝不要提交
+config.json
+.streamlit/secrets.toml
+.env
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
