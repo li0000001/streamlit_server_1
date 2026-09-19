@@ -16,7 +16,7 @@ import platform
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, unquote, parse_qsl
 import urllib.request
 import tarfile
 import streamlit as st
@@ -269,6 +269,51 @@ def _trojan_link(server, port, password, sni, ws_path, name):
     })
     host = f"[{server}]" if ":" in server else server
     return f"trojan://{quote(password)}@{host}:{port}?{query}#{quote(name)}"
+
+
+def decode_node_link(link):
+    """把一条节点链接解回 dict，用于自检。
+
+    vmess 返回完整字段；vless/trojan 是 URL 形式，只取得到 host/sni/名称。
+    解析不了就抛 ValueError —— 自检宁可报错，也不要静默放过。
+    """
+    link = str(link or "").strip()
+    if link.startswith("vmess://"):
+        raw = link[8:]
+        pad = raw + "=" * (-len(raw) % 4)
+        try:
+            return json.loads(base64.b64decode(pad).decode("utf-8"))
+        except Exception as exc:
+            raise ValueError(f"vmess 链接解码失败：{exc}") from exc
+    if link.startswith(("vless://", "trojan://")):
+        body, _, frag = link.partition("#")
+        query = body.split("?", 1)[1] if "?" in body else ""
+        params = dict(parse_qsl(query))
+        return {"ps": unquote(frag), "host": params.get("host", ""),
+                "sni": params.get("sni", "")}
+    raise ValueError("无法识别的链接协议")
+
+
+def validate_links(links, expected_domain):
+    """自检生成的节点链接，返回问题描述列表（空列表表示全部正常）。
+
+    这里只做「能不能自证一致」的检查，不改动任何链接：
+    - 每条链接都要能解码；
+    - host / sni 必须等于本次生成时用的隧道域名（不一致 = 客户端会握错 SNI，节点必然连不上）。
+    """
+    problems = []
+    for idx, link in enumerate(links, 1):
+        try:
+            obj = decode_node_link(link)
+        except ValueError as exc:
+            problems.append(f"第 {idx} 条：{exc}")
+            continue
+        name = (obj.get("ps") or "").strip() or f"第 {idx} 条"
+        for field in ("host", "sni"):
+            value = str(obj.get(field) or "").strip()
+            if value and expected_domain and value != expected_domain:
+                problems.append(f"「{name}」的 {field} = {value}，与隧道域名 {expected_domain} 不一致")
+    return problems
 
 
 def parse_target_line(line, default_port=443):
@@ -956,6 +1001,10 @@ def generate_all_configs(domain, cfg, port_vm_ws):
     links = build_node_links(domain, cfg)
     ALL_NODES_FILE.write_text("\n".join(links) + "\n", encoding="utf-8")
 
+    # 自检：链接必须自证一致（host/sni 都等于本次的隧道域名）。
+    # 出问题时不藏起来 —— 面板上直接标出来，否则用户拿到的是「看着正常、连不上」的节点。
+    problems = validate_links(links, domain)
+
     mode_text = "走代理链路" if str(cfg.get("outbound_mode")) == MODE_PROXY else "直连"
     output_text = f"""
 ✅ **服务已启动**
@@ -969,6 +1018,11 @@ def generate_all_configs(domain, cfg, port_vm_ws):
 ---
 **节点链接（共 {len(links)} 条，可复制）:**
 """ + "\n".join(links)
+
+    if problems:
+        output_text += (f"\n\n⚠️ **自检发现 {len(problems)} 处问题**"
+                        f"（这些节点的 SNI 与隧道域名对不上，客户端会握手失败）：\n"
+                        + "\n".join(f"- {p}" for p in problems))
 
     LIST_FILE.write_text(output_text, encoding="utf-8")
     return output_text
