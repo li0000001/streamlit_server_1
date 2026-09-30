@@ -622,7 +622,7 @@ def main():
     st.caption(f'配置优先读取 Streamlit Secrets；入口模式：{mode}。只有你点击启动时才切换正式服务。')
     st.write('sing-box：', '运行中' if ours(get_pid(SB_PID), SB_BIN) else '未运行',
              '；cloudflared：', '运行中' if ours(get_pid(CF_PID), CF_BIN) else '未运行')
-                  render_speed_test(
+    render_speed_test(
         st,
         cfg["test_port"],
         ours(get_pid(SB_PID), SB_BIN),
