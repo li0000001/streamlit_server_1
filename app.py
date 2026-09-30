@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Streamlit 面板：sing-box OpenVPN 出站 + cloudflared 入站（实验版）。"""
+"""Streamlit VPN Gate explorer + manually started sing-box OpenVPN egress."""
 import base64
+import csv
 import hmac
 import http.client
+import io
+import ipaddress
 import json
 import os
 import platform
@@ -17,8 +20,9 @@ import tarfile
 import time
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlparse
 
 import streamlit as st
 
@@ -32,13 +36,13 @@ SB_PID, CF_PID = HOME / "sb.pid", HOME / "cf.pid"
 SB_LOG, CF_LOG = HOME / "sb.log", HOME / "cf.log"
 NODES = HOME / "nodes.txt"
 SB_VERSION = "1.14.2"
+API_URL = "https://www.vpngate.net/api/iphone/"
 DEFAULT = dict(protocol="vless", uuid="", password="", ws_path="/",
                port=0, test_port=0, domain="", tunnel_token="",
                vpn_user="vpn", vpn_pass="vpn")
 IGNORE = {"client", "tls-client", "nobind", "persist-key", "persist-tun",
           "resolv-retry", "verb", "auth-nocache", "pull", "float",
-          "connect-retry", "connect-retry-max", "connect-timeout",
-          "server-poll-timeout"}
+          "connect-retry", "connect-retry-max", "connect-timeout", "server-poll-timeout"}
 FIELDS = {"remote", "proto", "cipher", "data-ciphers", "data-ciphers-fallback",
           "auth", "key-direction", "tls-version-min", "reneg-sec", "tun-mtu"}
 BLOCKS = {"ca", "cert", "key", "tls-auth", "tls-crypt", "tls-crypt-v2"}
@@ -47,13 +51,13 @@ BLOCKS = {"ca", "cert", "key", "tls-auth", "tls-crypt", "tls-crypt-v2"}
 def write_private(path, text):
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     HOME.chmod(0o700)
-    tmp = HOME / (".tmp-" + uuid.uuid4().hex)
+    temp = HOME / (".tmp-" + uuid.uuid4().hex)
     try:
-        tmp.write_text(text, encoding="utf-8")
-        tmp.chmod(0o600)
-        tmp.replace(path)
+        temp.write_text(text, encoding="utf-8")
+        temp.chmod(0o600)
+        temp.replace(path)
     finally:
-        tmp.unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
 
 
 def settings():
@@ -67,7 +71,6 @@ def settings():
 
 
 def parse_ovpn(text):
-    """只接收已实现的指令；不能静默忽略可能影响认证的参数。"""
     if len(text.encode("utf-8")) > 150000:
         raise ValueError(".ovpn 文件超过 150 KB")
     opts, blocks, active, buf = {}, {}, None, []
@@ -108,7 +111,7 @@ def parse_ovpn(text):
                 raise ValueError("仅支持 remote-cert-tls server")
         elif key == "setenv":
             if len(values) < 2 or values[0] not in ("CLIENT_CERT", "UV_DEVICE_ID"):
-                raise ValueError("不支持的 setenv 参数：" + " ".join(values)[:60])
+                raise ValueError("不支持的 setenv 参数")
         elif key in FIELDS:
             if key == "remote" and key in opts:
                 raise ValueError("当前仅支持一个 remote")
@@ -170,18 +173,110 @@ def parse_ovpn(text):
     return ep, auth_user_pass
 
 
+def public_ipv4(value):
+    try:
+        ip = ipaddress.ip_address(value)
+        return isinstance(ip, ipaddress.IPv4Address) and ip.is_global
+    except ValueError:
+        return False
+
+
+def load_candidates(country, limit):
+    """Official CSV; only a bounded set of compatible TCP .ovpn profiles."""
+    req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"})
+    with urllib.request.urlopen(req, timeout=22) as response:
+        final = urlparse(response.geturl())
+        if final.scheme != "https" or final.hostname not in ("www.vpngate.net", "api.vpngate.net") or final.path != "/api/iphone/":
+            raise ValueError("节点源重定向到非官方 API 地址")
+        raw = response.read(80_000_001)
+    if len(raw) > 80_000_000:
+        raise ValueError("节点清单超过 80 MB")
+    content = raw.decode("utf-8-sig", errors="replace")
+    header = content.find("#HostName,IP,Score,Ping,Speed,")
+    if header < 0:
+        raise ValueError("未找到 VPN Gate CSV 表头，源可能返回了网页")
+    rows = csv.DictReader(io.StringIO(content[header + 1:]))
+    needed = {"HostName", "IP", "Speed", "Ping", "CountryShort", "NumVpnSessions", "OpenVPN_ConfigData_Base64"}
+    if not needed.issubset(set(rows.fieldnames or [])):
+        raise ValueError("CSV 缺少必需列")
+    candidates, seen = [], set()
+    for row in rows:
+        if len(candidates) >= limit:
+            break
+        if country != "全部" and (row.get("CountryShort") or "").upper() != country:
+            continue
+        ip = (row.get("IP") or "").strip()
+        if not public_ipv4(ip):
+            continue
+        b64 = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
+        # Some CSV rows contain unquoted commas in the Message field.
+        # In that case DictReader stores the actual final base64 column in row[None].
+        if row.get(None):
+            b64 = row[None][-1].strip()
+        if len(b64) > 200000 or len(b64) < 100:
+            continue
+        try:
+            text = base64.b64decode(b64, validate=True).decode("utf-8-sig")
+            ep, _ = parse_ovpn(text)
+            if ep["network"] != "tcp":
+                continue
+            # A CSV entry is not trusted to redirect the probe to an arbitrary host.
+            remote = ep["server"]
+            if remote != ip and remote.lower().rstrip(".") not in {
+                (row.get("HostName") or "").lower().rstrip("."),
+                (row.get("HostName") or "").lower().rstrip(".") + ".opengw.net",
+            }:
+                continue
+            port = ep["server_port"]
+            identity = (ip, port)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            speed = max(0, int(row.get("Speed") or 0)) / 1_000_000
+            candidates.append({"host": (row.get("HostName") or ip)[:80], "ip": ip,
+                               "port": port, "country": (row.get("CountryShort") or "")[:3],
+                               "speed": round(speed, 1), "ping": row.get("Ping") or "?",
+                               "sessions": row.get("NumVpnSessions") or "?",
+                               "profile": text, "latency": None})
+        except (ValueError, UnicodeError, TypeError, OverflowError, IndexError):
+            continue
+    if not candidates:
+        raise ValueError("没有找到符合条件的兼容 TCP OpenVPN 配置；换国家或放宽候选数")
+    return candidates
+
+
+def probe(candidate):
+    """TCP connect latency only; never a VPN handshake or throughput benchmark."""
+    start = time.monotonic()
+    try:
+        with socket.create_connection((candidate["ip"], candidate["port"]), timeout=1.6):
+            return round((time.monotonic() - start) * 1000, 1)
+    except OSError:
+        return None
+
+
+def benchmark(candidates):
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(probe, item): item for item in candidates}
+        for future in as_completed(futures):
+            futures[future]["latency"] = future.result()
+    candidates.sort(key=lambda c: (c["latency"] is None,
+                                   c["latency"] if c["latency"] is not None else 1e9,
+                                   -c["speed"]))
+    return candidates
+
+
 def make_config(cfg, endpoint):
     user = ({"password": cfg["password"] or cfg["uuid"]} if cfg["protocol"] == "trojan"
             else {"uuid": cfg["uuid"]})
     if cfg["protocol"] == "vmess":
         user["alterId"] = 0
     return {"log": {"level": "info"},
-            "inbounds": [
-                {"type": cfg["protocol"], "tag": "client", "listen": "127.0.0.1",
-                 "listen_port": cfg["port"], "users": [user],
-                 "transport": {"type": "ws", "path": "/" + cfg["ws_path"].lstrip("/")}},
-                {"type": "socks", "tag": "test", "listen": "127.0.0.1",
-                 "listen_port": cfg["test_port"]}],
+            "inbounds": [{"type": cfg["protocol"], "tag": "client", "listen": "127.0.0.1",
+                          "listen_port": cfg["port"], "users": [user],
+                          "transport": {"type": "ws", "path": "/" + cfg["ws_path"].lstrip("/")}},
+                         {"type": "socks", "tag": "test", "listen": "127.0.0.1",
+                          "listen_port": cfg["test_port"]}],
             "endpoints": [endpoint], "route": {"final": "vpn-exit"}}
 
 
@@ -280,8 +375,7 @@ def quick_domain(process):
     for _ in range(60):
         if process.poll() is not None:
             raise RuntimeError("cloudflared 提前退出：" + log_text(CF_LOG)[-1500:])
-        text = log_text(CF_LOG)  # 扫描完整日志，域名可能位于开头
-        match = pattern.search(text)
+        match = pattern.search(log_text(CF_LOG))
         if match:
             return match.group(1)
         time.sleep(.5)
@@ -304,7 +398,7 @@ def node_link(domain, cfg):
 
 def start(cfg):
     if not PROFILE.exists():
-        raise ValueError("请先上传并保存 VPN Gate 的 .ovpn 文件")
+        raise ValueError("请先选择并添加候选，或手动上传 .ovpn")
     endpoint, needs_password = parse_ovpn(PROFILE.read_text(encoding="utf-8"))
     cfg = dict(cfg)
     if cfg["protocol"] not in ("vless", "vmess", "trojan"):
@@ -317,7 +411,7 @@ def start(cfg):
         raise ValueError("入口端口与检测端口冲突")
     if cfg["tunnel_token"] and not cfg["domain"]:
         raise ValueError("固定 Tunnel Token 需要对应域名")
-    if needs_password:  # 修复：证书认证的 .ovpn 不强行注入用户名/密码
+    if needs_password:
         endpoint["username"] = cfg["vpn_user"] or "vpn"
         endpoint["password"] = cfg["vpn_pass"] or "vpn"
     binaries()
@@ -354,7 +448,7 @@ def start(cfg):
         if cf.poll() is not None:
             raise RuntimeError("cloudflared 已退出：" + log_text(CF_LOG)[-1500:])
         if "authentication failed" in log_text(SB_LOG).lower():
-            raise RuntimeError("VPN 认证失败；请检查 .ovpn 是否需要 auth-user-pass、证书是否匹配，以及节点是否可用")
+            raise RuntimeError("VPN 认证失败；检查配置或更换节点")
         write_private(NODES, node_link(domain, cfg) + "\n")
         write_private(SETTINGS, json.dumps(cfg, ensure_ascii=False, indent=2))
         return domain
@@ -374,7 +468,6 @@ def recv_exact(sock, n):
 
 
 def verify_exit(port):
-    """通过 sing-box 本地 SOCKS 入口查询 IP，不使用 Python 直连。"""
     host = "api.country.is"
     sock = socket.create_connection(("127.0.0.1", int(port)), timeout=15)
     sock.settimeout(15)
@@ -408,7 +501,7 @@ def verify_exit(port):
 
 
 def main():
-    st.set_page_config(page_title="VPN Gate 出站管理", layout="wide")
+    st.set_page_config(page_title="VPN Gate 节点优选", layout="wide")
     try:
         secret = str(st.secrets.get("SECRET_KEY", ""))
     except (OSError, FileNotFoundError):
@@ -417,7 +510,7 @@ def main():
         st.error("请在 Streamlit Secrets 中设置非默认的 SECRET_KEY")
         return
     if not st.session_state.get("logged_in"):
-        st.title("VPN Gate 出站管理登录")
+        st.title("VPN Gate 管理登录")
         password = st.text_input("管理口令", type="password")
         if st.button("登录"):
             if hmac.compare_digest(password, secret):
@@ -428,26 +521,69 @@ def main():
         return
     if st.sidebar.button("退出登录"):
         st.session_state.logged_in = False
+        st.session_state.pop("candidates", None)
         st.rerun()
     cfg = settings()
     st.title("VPN Gate OpenVPN 出站")
     st.write("sing-box：", "运行中" if ours(get_pid(SB_PID), SB_BIN) else "未运行",
              "；cloudflared：", "运行中" if ours(get_pid(CF_PID), CF_BIN) else "未运行")
-    upload = st.file_uploader("VPN Gate .ovpn 配置", type=["ovpn"])
-    if upload is not None and st.button("保存 .ovpn"):
+    st.subheader("拉取候选并优选")
+    st.caption("只筛选 CSV 中附带的 TCP OpenVPN 配置；从本容器测 TCP 连接延迟。"
+               "官网 Speed 是网站报告值，不是本机下载速度；测速不建立 VPN，也不会启动服务。")
+    col1, col2 = st.columns(2)
+    country = col1.selectbox("国家或地区", ["JP", "KR", "US", "全部"], index=0)
+    limit = col2.slider("候选上限", 5, 40, 20, step=5)
+    if st.button("拉取并测试候选", type="primary"):
+        try:
+            with st.spinner("读取清单并测试 TCP 可达性..."):
+                candidates = benchmark(load_candidates(country, limit))
+            st.session_state["candidates"] = candidates
+            st.success(f"已检测 {len(candidates)} 个兼容候选；选择后仅保存配置，不启动")
+        except Exception as exc:
+            st.session_state.pop("candidates", None)
+            st.error("拉取或测速失败：" + str(exc))
+    candidates = st.session_state.get("candidates", [])
+    if candidates:
+        display = []
+        for i, c in enumerate(candidates):
+            display.append({"序号": i + 1, "节点": c["host"], "国家": c["country"],
+                            "本机TCP连接延迟(ms)": c["latency"] if c["latency"] is not None else "不可达",
+                            "官网Speed(Mbps)": c["speed"], "官网Ping(ms)": c["ping"],
+                            "会话数": c["sessions"], "IP": c["ip"], "端口": c["port"]})
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        choices = [i for i, c in enumerate(candidates) if c["latency"] is not None]
+        if choices:
+            selected = st.selectbox("选择节点（默认本机 TCP 延迟最低）", choices,
+                                    format_func=lambda i: f"{i + 1}. {candidates[i]['host']} "
+                                    f"{candidates[i]['country']} / {candidates[i]['latency']} ms / "
+                                    f"官网 {candidates[i]['speed']} Mbps")
+            if st.button("添加所选节点到当前 .ovpn（不启动）"):
+                chosen = candidates[selected]
+                ep, _ = parse_ovpn(chosen["profile"])
+                if ep["network"] != "tcp":
+                    st.error("所选配置不是 TCP")
+                else:
+                    write_private(PROFILE, chosen["profile"])
+                    st.success(f"已添加 {chosen['host']}；运行中的服务不受影响。准备好后由你点击启动/重启服务。")
+        else:
+            st.warning("没有可达 TCP 候选；可换地区或稍后重试")
+    st.divider()
+    st.subheader("当前落地配置")
+    upload = st.file_uploader("也可手动上传 VPN Gate .ovpn", type=["ovpn"])
+    if upload is not None and st.button("保存手动上传的 .ovpn"):
         try:
             text = upload.getvalue().decode("utf-8-sig")
-            endpoint, auth = parse_ovpn(text)
+            ep, _ = parse_ovpn(text)
             write_private(PROFILE, text)
-            st.success(f"已保存 {endpoint['server']}:{endpoint['server_port']} / {endpoint['network']}；账号认证：{'需要' if auth else '配置未要求'}")
+            st.success(f"已保存 {ep['server']}:{ep['server_port']} / {ep['network']}；未启动")
         except Exception as exc:
             st.error(".ovpn 不兼容：" + str(exc))
     if PROFILE.exists():
         try:
             ep, auth = parse_ovpn(PROFILE.read_text(encoding="utf-8"))
-            st.info(f"当前 VPN：{ep['server']}:{ep['server_port']} / {ep['network']}；账号认证：{'需要' if auth else '配置未要求'}")
+            st.info(f"已保存：{ep['server']}:{ep['server_port']} / {ep['network']}；账号认证：{'需要' if auth else '配置未要求'}")
         except Exception as exc:
-            st.warning("当前 .ovpn 无效：" + str(exc))
+            st.warning("已保存的配置无效：" + str(exc))
     with st.form("settings_form"):
         choices = ["vless", "vmess", "trojan"]
         protocol = st.selectbox("入站协议", choices, index=choices.index(cfg["protocol"]) if cfg["protocol"] in choices else 0)
@@ -488,7 +624,7 @@ def main():
         except Exception as exc:
             st.error("验证失败：" + str(exc))
             if "authentication failed" in log_text(SB_LOG).lower():
-                st.error("sing-box 日志显示 VPN 认证失败；更换匹配的 .ovpn 或核对认证要求")
+                st.error("sing-box 日志显示 VPN 认证失败；请更换匹配的 .ovpn 或核对认证要求")
     if c3.button("停止服务", use_container_width=True):
         stop()
         st.info("已停止本项目记录的进程")
