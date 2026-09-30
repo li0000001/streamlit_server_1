@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Streamlit VPN Gate explorer + manually started sing-box OpenVPN egress."""
+"""Streamlit VPN Gate panel. Secrets are authoritative; tunnel falls back to quick mode only if both values are blank."""
 import base64
 import csv
 import hmac
@@ -28,53 +28,103 @@ import streamlit as st
 
 HOME = Path.home() / ".agsb"
 PROFILE = HOME / "vpngate.ovpn"
-SETTINGS = HOME / "settings.json"
 SB_CONF = HOME / "sb.json"
-SB_BIN = HOME / "sing-box"
-CF_BIN = HOME / "cloudflared"
+SB_BIN, CF_BIN = HOME / "sing-box", HOME / "cloudflared"
 SB_PID, CF_PID = HOME / "sb.pid", HOME / "cf.pid"
 SB_LOG, CF_LOG = HOME / "sb.log", HOME / "cf.log"
-NODES = HOME / "nodes.txt"
+NODES, RUNTIME = HOME / "nodes.txt", HOME / "runtime.json"
 SB_VERSION = "1.14.2"
 API_URL = "https://www.vpngate.net/api/iphone/"
-DEFAULT = dict(protocol="vless", uuid="", password="", ws_path="/",
-               port=0, test_port=0, domain="", tunnel_token="",
-               vpn_user="vpn", vpn_pass="vpn")
-IGNORE = {"client", "tls-client", "nobind", "persist-key", "persist-tun",
-          "resolv-retry", "verb", "auth-nocache", "pull", "float",
-          "connect-retry", "connect-retry-max", "connect-timeout", "server-poll-timeout"}
-FIELDS = {"remote", "proto", "cipher", "data-ciphers", "data-ciphers-fallback",
-          "auth", "key-direction", "tls-version-min", "reneg-sec", "tun-mtu"}
+IGNORE = {"client", "tls-client", "nobind", "persist-key", "persist-tun", "resolv-retry", "verb", "auth-nocache", "pull", "float", "connect-retry", "connect-retry-max", "connect-timeout", "server-poll-timeout"}
+FIELDS = {"remote", "proto", "cipher", "data-ciphers", "data-ciphers-fallback", "auth", "key-direction", "tls-version-min", "reneg-sec", "tun-mtu"}
 BLOCKS = {"ca", "cert", "key", "tls-auth", "tls-crypt", "tls-crypt-v2"}
 
 
-def write_private(path, text):
+def secret(name, default=""):
+    try:
+        value = st.secrets.get(name, default)
+    except (OSError, FileNotFoundError):
+        value = default
+    return value
+
+
+def write_private(path, data):
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     HOME.chmod(0o700)
-    temp = HOME / (".tmp-" + uuid.uuid4().hex)
+    tmp = HOME / (".tmp-" + uuid.uuid4().hex)
     try:
-        temp.write_text(text, encoding="utf-8")
-        temp.chmod(0o600)
-        temp.replace(path)
+        tmp.write_text(data, encoding="utf-8")
+        tmp.chmod(0o600)
+        tmp.replace(path)
     finally:
-        temp.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+
+
+def read_runtime():
+    try:
+        obj = json.loads(RUNTIME.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def choose_port(value, old=0):
+    if value is None or str(value).strip() in ("", "0"):
+        if isinstance(old, int) and 1 <= old <= 65535:
+            return old
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("PORT_VM_WS / TEST_PORT 必须是有效端口") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("PORT_VM_WS / TEST_PORT 必须在 1-65535 之间")
+    return port
 
 
 def settings():
+    """Secrets always win; generated UUID and ports are only used when blank."""
+    saved = read_runtime()
+    token = str(secret("ARGO_TOKEN", "") or "").strip()
+    domain = str(secret("CUSTOM_DOMAIN", "") or "").strip()
+    if bool(token) != bool(domain):
+        raise ValueError("ARGO_TOKEN 和 CUSTOM_DOMAIN 必须同时填写，或同时留空以使用临时隧道")
+    if domain:
+        parsed = urlparse("https://" + domain)
+        if (not re.fullmatch(r"[A-Za-z0-9.-]{1,253}", domain)
+                or parsed.hostname != domain.lower() or domain.startswith(".")):
+            raise ValueError("CUSTOM_DOMAIN 只填写域名，不要填写 https://、路径或端口")
+    uid = str(secret("UUID_STR", "") or "").strip() or str(saved.get("uuid", "") or "")
+    if not uid:
+        uid = str(uuid.uuid4())
     try:
-        obj = json.loads(SETTINGS.read_text(encoding="utf-8"))
-        if isinstance(obj, dict):
-            return {**DEFAULT, **{k: v for k, v in obj.items() if k in DEFAULT}}
-    except (OSError, ValueError):
-        pass
-    return DEFAULT.copy()
+        uuid.UUID(uid)
+    except ValueError as exc:
+        raise ValueError("UUID_STR 不是有效的 UUID") from exc
+    port = choose_port(secret("PORT_VM_WS", ""), saved.get("port", 0))
+    test_port = choose_port(secret("TEST_PORT", ""), saved.get("test_port", 0))
+    if port == test_port:
+        raise ValueError("TEST_PORT 不能与 PORT_VM_WS 相同")
+    protocol = str(secret("PROTOCOL", "vless") or "vless").lower().strip()
+    if protocol not in ("vless", "vmess", "trojan"):
+        raise ValueError("PROTOCOL 只能是 vless、vmess 或 trojan")
+    cfg = {"protocol": protocol, "uuid": uid, "port": port, "test_port": test_port,
+           "ws_path": "/" + str(secret("WS_PATH", "/") or "/").strip().lstrip("/"),
+           "trojan_password": str(secret("TROJAN_PASSWORD", "") or ""),
+           "vpn_user": str(secret("VPN_USER", "vpn") or "vpn"),
+           "vpn_pass": str(secret("VPN_PASS", "vpn") or "vpn"),
+           "token": token, "domain": domain}
+    # Only generated non-secret values are persisted. Secrets are never copied into runtime.json.
+    write_private(RUNTIME, json.dumps({"uuid": uid, "port": port, "test_port": test_port}))
+    return cfg
 
 
 def parse_ovpn(text):
     if len(text.encode("utf-8")) > 150000:
         raise ValueError(".ovpn 文件超过 150 KB")
-    opts, blocks, active, buf = {}, {}, None, []
-    auth_user_pass = False
+    opts, blocks, active, buf, user_pass = {}, {}, None, [], False
     for raw in text.replace("\r\n", "\n").splitlines():
         line = raw.strip()
         if active:
@@ -93,37 +143,35 @@ def parse_ovpn(text):
             active, buf = tag, []
             continue
         try:
-            args = shlex.split(line, comments=True)
+            parts = shlex.split(line, comments=True)
         except ValueError as exc:
-            raise ValueError(".ovpn 指令解析失败") from exc
-        if not args:
+            raise ValueError(".ovpn 指令格式错误") from exc
+        if not parts:
             continue
-        key, values = args[0].lower(), args[1:]
+        key, args = parts[0].lower(), parts[1:]
         if key == "auth-user-pass":
-            if values:
-                raise ValueError("不支持外部凭据文件，请在面板填写 VPN 账号")
-            auth_user_pass = True
+            if args:
+                raise ValueError("不支持外部凭据文件")
+            user_pass = True
         elif key == "dev":
-            if values != ["tun"]:
+            if args != ["tun"]:
                 raise ValueError("仅支持 dev tun")
         elif key == "remote-cert-tls":
-            if values != ["server"]:
+            if args != ["server"]:
                 raise ValueError("仅支持 remote-cert-tls server")
         elif key == "setenv":
-            if len(values) < 2 or values[0] not in ("CLIENT_CERT", "UV_DEVICE_ID"):
+            if len(args) < 2 or args[0] not in ("CLIENT_CERT", "UV_DEVICE_ID"):
                 raise ValueError("不支持的 setenv 参数")
         elif key in FIELDS:
             if key == "remote" and key in opts:
-                raise ValueError("当前仅支持一个 remote")
-            opts[key] = values
+                raise ValueError("仅支持单个 remote")
+            opts[key] = args
         elif key not in IGNORE:
             raise ValueError("不支持的 .ovpn 指令：" + key)
-    if active:
-        raise ValueError("内联块未闭合：" + active)
-    if not blocks.get("ca"):
-        raise ValueError("需要内联 <ca> 证书")
+    if active or not blocks.get("ca"):
+        raise ValueError("缺少完整内联 <ca> 证书")
     if bool(blocks.get("cert")) != bool(blocks.get("key")):
-        raise ValueError("<cert> 和 <key> 必须同时存在")
+        raise ValueError("<cert> 和 <key> 必须同时提供")
     remote = opts.get("remote", [])
     if len(remote) not in (2, 3):
         raise ValueError("remote 必须包含主机和端口")
@@ -144,10 +192,8 @@ def parse_ovpn(text):
     if blocks.get("cert"):
         tls.update(client_certificate=[blocks["cert"]], client_key=[blocks["key"]])
     wraps = [k for k in ("tls-auth", "tls-crypt", "tls-crypt-v2") if blocks.get(k)]
-    if len(wraps) > 1:
-        raise ValueError("tls-auth 与 tls-crypt 系列不可同时使用")
-    if opts.get("key-direction") and wraps != ["tls-auth"]:
-        raise ValueError("key-direction 仅适用于 tls-auth")
+    if len(wraps) > 1 or (opts.get("key-direction") and wraps != ["tls-auth"]):
+        raise ValueError("tls-auth/tls-crypt/key-direction 配置冲突")
     if wraps:
         tls["control_wrap"] = {"type": wraps[0].replace("-", "_"), "key": [blocks[wraps[0]]]}
         if opts.get("key-direction"):
@@ -155,144 +201,130 @@ def parse_ovpn(text):
             if direction not in ("0", "1"):
                 raise ValueError("key-direction 必须为 0 或 1")
             tls["control_wrap"]["direction"] = "client" if direction == "1" else "server"
-    ep = {"type": "openvpn-client", "tag": "vpn-exit", "mode": "tls",
-          "server": host, "server_port": port, "network": network,
-          "system": False, "tls": tls}
+    endpoint = {"type": "openvpn-client", "tag": "vpn-exit", "mode": "tls",
+                "server": host, "server_port": port, "network": network, "system": False, "tls": tls}
     for src, dest in (("auth", "auth"), ("cipher", "data_ciphers_fallback"),
                       ("data-ciphers-fallback", "data_ciphers_fallback")):
         if opts.get(src):
-            ep[dest] = opts[src][0]
+            endpoint[dest] = opts[src][0]
     if opts.get("data-ciphers"):
-        ep["data_ciphers"] = opts["data-ciphers"][0].split(":")
+        endpoint["data_ciphers"] = opts["data-ciphers"][0].split(":")
     if opts.get("tun-mtu"):
-        ep["mtu"] = int(opts["tun-mtu"][0])
+        endpoint["mtu"] = int(opts["tun-mtu"][0])
     if opts.get("reneg-sec"):
-        ep["renegotiate_interval"] = opts["reneg-sec"][0] + "s"
+        endpoint["renegotiate_interval"] = opts["reneg-sec"][0] + "s"
     if opts.get("tls-version-min") and opts["tls-version-min"][0] != "1.2":
         raise ValueError("仅支持 tls-version-min 1.2")
-    return ep, auth_user_pass
+    return endpoint, user_pass
 
 
-def public_ipv4(value):
+def global_ipv4(ip):
     try:
-        ip = ipaddress.ip_address(value)
-        return isinstance(ip, ipaddress.IPv4Address) and ip.is_global
+        addr = ipaddress.ip_address(ip)
+        return isinstance(addr, ipaddress.IPv4Address) and addr.is_global
     except ValueError:
         return False
 
 
-def load_candidates(country, limit):
-    """Official CSV; only a bounded set of compatible TCP .ovpn profiles."""
-    req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0", "Accept": "text/plain"})
-    with urllib.request.urlopen(req, timeout=22) as response:
-        final = urlparse(response.geturl())
+def candidates(country, limit):
+    req = urllib.request.Request(API_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        final = urlparse(resp.geturl())
         if final.scheme != "https" or final.hostname not in ("www.vpngate.net", "api.vpngate.net") or final.path != "/api/iphone/":
-            raise ValueError("节点源重定向到非官方 API 地址")
-        raw = response.read(80_000_001)
+            raise ValueError("节点源不在 VPN Gate 官方 API 地址")
+        raw = resp.read(80_000_001)
     if len(raw) > 80_000_000:
-        raise ValueError("节点清单超过 80 MB")
+        raise ValueError("CSV 超过 80 MB")
     content = raw.decode("utf-8-sig", errors="replace")
-    header = content.find("#HostName,IP,Score,Ping,Speed,")
-    if header < 0:
-        raise ValueError("未找到 VPN Gate CSV 表头，源可能返回了网页")
-    rows = csv.DictReader(io.StringIO(content[header + 1:]))
-    needed = {"HostName", "IP", "Speed", "Ping", "CountryShort", "NumVpnSessions", "OpenVPN_ConfigData_Base64"}
-    if not needed.issubset(set(rows.fieldnames or [])):
-        raise ValueError("CSV 缺少必需列")
-    candidates, seen = [], set()
+    pos = content.find("#HostName,IP,Score,Ping,Speed,")
+    if pos < 0:
+        raise ValueError("VPN Gate 未返回预期 CSV")
+    rows = csv.DictReader(io.StringIO(content[pos + 1:]))
+    if not {"IP", "CountryShort", "Speed", "OpenVPN_ConfigData_Base64"}.issubset(rows.fieldnames or []):
+        raise ValueError("CSV 字段不完整")
+    result, seen = [], set()
     for row in rows:
-        if len(candidates) >= limit:
+        if len(result) >= limit:
             break
         if country != "全部" and (row.get("CountryShort") or "").upper() != country:
             continue
         ip = (row.get("IP") or "").strip()
-        if not public_ipv4(ip):
+        if not global_ipv4(ip):
             continue
         b64 = (row.get("OpenVPN_ConfigData_Base64") or "").strip()
-        # Some CSV rows contain unquoted commas in the Message field.
-        # In that case DictReader stores the actual final base64 column in row[None].
         if row.get(None):
             b64 = row[None][-1].strip()
-        if len(b64) > 200000 or len(b64) < 100:
+        if not 100 <= len(b64) <= 200000:
             continue
         try:
-            text = base64.b64decode(b64, validate=True).decode("utf-8-sig")
-            ep, _ = parse_ovpn(text)
+            profile = base64.b64decode(b64, validate=True).decode("utf-8-sig")
+            ep, _ = parse_ovpn(profile)
             if ep["network"] != "tcp":
                 continue
-            # A CSV entry is not trusted to redirect the probe to an arbitrary host.
-            remote = ep["server"]
-            if remote != ip and remote.lower().rstrip(".") not in {
-                (row.get("HostName") or "").lower().rstrip("."),
-                (row.get("HostName") or "").lower().rstrip(".") + ".opengw.net",
-            }:
+            hostname = (row.get("HostName") or "").strip().lower().rstrip(".")
+            remote = ep["server"].lower().rstrip(".")
+            if remote != ip and remote not in (hostname, hostname + ".opengw.net"):
                 continue
-            port = ep["server_port"]
-            identity = (ip, port)
+            identity = (ip, ep["server_port"])
             if identity in seen:
                 continue
             seen.add(identity)
-            speed = max(0, int(row.get("Speed") or 0)) / 1_000_000
-            candidates.append({"host": (row.get("HostName") or ip)[:80], "ip": ip,
-                               "port": port, "country": (row.get("CountryShort") or "")[:3],
-                               "speed": round(speed, 1), "ping": row.get("Ping") or "?",
-                               "sessions": row.get("NumVpnSessions") or "?",
-                               "profile": text, "latency": None})
-        except (ValueError, UnicodeError, TypeError, OverflowError, IndexError):
+            result.append({"host": hostname or ip, "ip": ip, "port": ep["server_port"],
+                           "country": row.get("CountryShort", ""),
+                           "speed": round(max(0, int(row.get("Speed") or 0)) / 1e6, 1),
+                           "ping": row.get("Ping", "?"), "profile": profile, "latency": None})
+        except (ValueError, UnicodeError, TypeError, IndexError, OverflowError):
             continue
-    if not candidates:
-        raise ValueError("没有找到符合条件的兼容 TCP OpenVPN 配置；换国家或放宽候选数")
-    return candidates
+    if not result:
+        raise ValueError("没有找到兼容的 TCP OpenVPN 候选；可换地区或手动上传 .ovpn")
+    return result
 
 
-def probe(candidate):
-    """TCP connect latency only; never a VPN handshake or throughput benchmark."""
+def probe(item):
     start = time.monotonic()
     try:
-        with socket.create_connection((candidate["ip"], candidate["port"]), timeout=1.6):
+        with socket.create_connection((item["ip"], item["port"]), timeout=1.6):
             return round((time.monotonic() - start) * 1000, 1)
     except OSError:
         return None
 
 
-def benchmark(candidates):
+def benchmark(items):
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(probe, item): item for item in candidates}
-        for future in as_completed(futures):
-            futures[future]["latency"] = future.result()
-    candidates.sort(key=lambda c: (c["latency"] is None,
-                                   c["latency"] if c["latency"] is not None else 1e9,
-                                   -c["speed"]))
-    return candidates
+        future_map = {pool.submit(probe, item): item for item in items}
+        for f in as_completed(future_map):
+            future_map[f]["latency"] = f.result()
+    items.sort(key=lambda x: (x["latency"] is None, x["latency"] or 1e9, -x["speed"]))
+    return items
 
 
 def make_config(cfg, endpoint):
-    user = ({"password": cfg["password"] or cfg["uuid"]} if cfg["protocol"] == "trojan"
+    user = ({"password": cfg["trojan_password"] or cfg["uuid"]} if cfg["protocol"] == "trojan"
             else {"uuid": cfg["uuid"]})
     if cfg["protocol"] == "vmess":
         user["alterId"] = 0
     return {"log": {"level": "info"},
             "inbounds": [{"type": cfg["protocol"], "tag": "client", "listen": "127.0.0.1",
                           "listen_port": cfg["port"], "users": [user],
-                          "transport": {"type": "ws", "path": "/" + cfg["ws_path"].lstrip("/")}},
+                          "transport": {"type": "ws", "path": cfg["ws_path"]}},
                          {"type": "socks", "tag": "test", "listen": "127.0.0.1",
                           "listen_port": cfg["test_port"]}],
             "endpoints": [endpoint], "route": {"final": "vpn-exit"}}
 
 
-def get_pid(path):
+def pid(path):
     try:
         n = int(path.read_text().strip())
         return n if n > 0 else None
-    except (OSError, ValueError, TypeError, OverflowError):
+    except (OSError, TypeError, ValueError, OverflowError):
         return None
 
 
-def ours(number, binary):
-    if not number:
+def ours(n, binary):
+    if not n:
         return False
     try:
-        proc = Path("/proc") / str(number)
+        proc = Path("/proc") / str(n)
         return ((proc / "exe").resolve(strict=True) == binary.resolve(strict=True)
                 and not re.search(r"^State:\s+Z", (proc / "status").read_text(), re.M))
     except OSError:
@@ -301,31 +333,39 @@ def ours(number, binary):
 
 def stop():
     for path, binary in ((CF_PID, CF_BIN), (SB_PID, SB_BIN)):
-        n = get_pid(path)
+        n = pid(path)
         if ours(n, binary):
             try:
                 os.kill(n, 15)
             except OSError:
                 pass
         path.unlink(missing_ok=True)
+    NODES.unlink(missing_ok=True)
 
 
-def download(url, path):
+def log_text(path):
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def download(url, target):
     HOME.mkdir(parents=True, exist_ok=True)
     tmp = HOME / (".download-" + uuid.uuid4().hex)
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=35) as src, tmp.open("wb") as out:
-            total = 0
+        with urllib.request.urlopen(req, timeout=35) as src, tmp.open("wb") as dst:
+            size = 0
             while True:
-                block = src.read(1024 * 1024)
-                if not block:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
                     break
-                total += len(block)
-                if total > 100_000_000:
+                size += len(chunk)
+                if size > 100_000_000:
                     raise RuntimeError("下载超过 100 MB")
-                out.write(block)
-        tmp.replace(path)
+                dst.write(chunk)
+        tmp.replace(target)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -345,11 +385,11 @@ def binaries():
         archive = HOME / "sing-box.tar.gz"
         download(f"https://github.com/SagerNet/sing-box/releases/download/v{SB_VERSION}/{folder}.tar.gz", archive)
         with tarfile.open(archive, "r:gz") as tar:
-            member = next((m for m in tar.getmembers() if m.name == folder + "/sing-box" and m.isfile()), None)
-            if not member:
-                raise RuntimeError("sing-box 压缩包不含预期程序")
-            with tar.extractfile(member) as src, SB_BIN.open("wb") as out:
-                shutil.copyfileobj(src, out)
+            member = next((x for x in tar.getmembers() if x.name == folder + "/sing-box" and x.isfile()), None)
+            if member is None:
+                raise RuntimeError("sing-box 安装包内容异常")
+            with tar.extractfile(member) as src, SB_BIN.open("wb") as dst:
+                shutil.copyfileobj(src, dst)
         archive.unlink(missing_ok=True)
         SB_BIN.chmod(0o700)
     if not CF_BIN.exists():
@@ -357,67 +397,41 @@ def binaries():
         CF_BIN.chmod(0o700)
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def log_text(path):
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
-
-
-def quick_domain(process):
+def quick_domain(proc):
     pattern = re.compile(r"https://([a-zA-Z0-9.-]+\.trycloudflare\.com)")
     for _ in range(60):
-        if process.poll() is not None:
+        if proc.poll() is not None:
             raise RuntimeError("cloudflared 提前退出：" + log_text(CF_LOG)[-1500:])
         match = pattern.search(log_text(CF_LOG))
         if match:
             return match.group(1)
         time.sleep(.5)
-    raise RuntimeError("完整 cloudflared 日志未找到域名；日志开头：" + log_text(CF_LOG)[:1500])
+    raise RuntimeError("完整 cloudflared 日志未发现临时域名：" + log_text(CF_LOG)[:1500])
 
 
 def node_link(domain, cfg):
-    path = "/" + cfg["ws_path"].lstrip("/")
-    query = urlencode({"security": "tls", "sni": domain, "type": "ws", "host": domain, "path": path})
+    q = urlencode({"security": "tls", "sni": domain, "type": "ws", "host": domain, "path": cfg["ws_path"]})
     if cfg["protocol"] == "vmess":
-        obj = {"v": "2", "ps": "VPN Gate", "add": domain, "port": "443",
-               "id": cfg["uuid"], "aid": "0", "scy": "auto", "net": "ws",
-               "type": "none", "host": domain, "path": path, "tls": "tls", "sni": domain}
+        obj = {"v": "2", "ps": "VPN Gate", "add": domain, "port": "443", "id": cfg["uuid"],
+               "aid": "0", "scy": "auto", "net": "ws", "type": "none", "host": domain,
+               "path": cfg["ws_path"], "tls": "tls", "sni": domain}
         return "vmess://" + base64.b64encode(json.dumps(obj).encode()).decode().rstrip("=")
-    credential = cfg["uuid"] if cfg["protocol"] == "vless" else cfg["password"] or cfg["uuid"]
+    credential = cfg["uuid"] if cfg["protocol"] == "vless" else cfg["trojan_password"] or cfg["uuid"]
     if cfg["protocol"] == "vless":
-        query = "encryption=none&" + query
-    return f"{cfg['protocol']}://{quote(credential, safe='')}@{domain}:443?{query}#VPN-Gate"
+        q = "encryption=none&" + q
+    return f"{cfg['protocol']}://{quote(credential, safe='')}@{domain}:443?{q}#VPN-Gate"
 
 
 def start(cfg):
     if not PROFILE.exists():
-        raise ValueError("请先选择并添加候选，或手动上传 .ovpn")
+        raise ValueError("先添加候选节点或手动上传 .ovpn")
     endpoint, needs_password = parse_ovpn(PROFILE.read_text(encoding="utf-8"))
-    cfg = dict(cfg)
-    if cfg["protocol"] not in ("vless", "vmess", "trojan"):
-        raise ValueError("入站协议无效")
-    cfg["uuid"] = cfg["uuid"] or str(uuid.uuid4())
-    uuid.UUID(cfg["uuid"])
-    cfg["port"] = int(cfg["port"] or free_port())
-    cfg["test_port"] = int(cfg["test_port"] or free_port())
-    if cfg["port"] == cfg["test_port"]:
-        raise ValueError("入口端口与检测端口冲突")
-    if cfg["tunnel_token"] and not cfg["domain"]:
-        raise ValueError("固定 Tunnel Token 需要对应域名")
     if needs_password:
-        endpoint["username"] = cfg["vpn_user"] or "vpn"
-        endpoint["password"] = cfg["vpn_pass"] or "vpn"
+        endpoint["username"] = cfg["vpn_user"]
+        endpoint["password"] = cfg["vpn_pass"]
     binaries()
     write_private(SB_CONF, json.dumps(make_config(cfg, endpoint), ensure_ascii=False, indent=2))
-    check = subprocess.run([str(SB_BIN), "check", "-c", str(SB_CONF)],
-                           capture_output=True, text=True, timeout=25)
+    check = subprocess.run([str(SB_BIN), "check", "-c", str(SB_CONF)], capture_output=True, text=True, timeout=25)
     if check.returncode:
         raise RuntimeError("sing-box 配置检查失败：" + (check.stderr or check.stdout)[-1500:])
     stop()
@@ -435,22 +449,21 @@ def start(cfg):
             except OSError:
                 time.sleep(.2)
         else:
-            raise RuntimeError("sing-box 入口未就绪：" + log_text(SB_LOG)[-1500:])
-        if cfg["tunnel_token"]:
-            cmd = [str(CF_BIN), "tunnel", "--no-autoupdate", "run", "--token", cfg["tunnel_token"]]
+            raise RuntimeError("sing-box 本地入口未就绪：" + log_text(SB_LOG)[-1500:])
+        if cfg["token"]:
+            cmd = [str(CF_BIN), "tunnel", "--no-autoupdate", "run", "--token", cfg["token"]]
         else:
             cmd = [str(CF_BIN), "tunnel", "--no-autoupdate", "--url",
                    f"http://127.0.0.1:{cfg['port']}", "--protocol", "http2"]
         with CF_LOG.open("w") as out:
             cf = subprocess.Popen(cmd, cwd=HOME, stdout=out, stderr=subprocess.STDOUT)
         write_private(CF_PID, str(cf.pid))
-        domain = cfg["domain"] if cfg["tunnel_token"] else quick_domain(cf)
+        domain = cfg["domain"] if cfg["token"] else quick_domain(cf)
         if cf.poll() is not None:
             raise RuntimeError("cloudflared 已退出：" + log_text(CF_LOG)[-1500:])
         if "authentication failed" in log_text(SB_LOG).lower():
-            raise RuntimeError("VPN 认证失败；检查配置或更换节点")
+            raise RuntimeError("VPN 认证失败；检查 .ovpn 或更换节点")
         write_private(NODES, node_link(domain, cfg) + "\n")
-        write_private(SETTINGS, json.dumps(cfg, ensure_ascii=False, indent=2))
         return domain
     except Exception:
         stop()
@@ -458,23 +471,23 @@ def start(cfg):
 
 
 def recv_exact(sock, n):
-    data = b""
-    while len(data) < n:
-        chunk = sock.recv(n - len(data))
-        if not chunk:
+    result = b""
+    while len(result) < n:
+        block = sock.recv(n - len(result))
+        if not block:
             raise OSError("连接提前断开")
-        data += chunk
-    return data
+        result += block
+    return result
 
 
 def verify_exit(port):
     host = "api.country.is"
-    sock = socket.create_connection(("127.0.0.1", int(port)), timeout=15)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=15)
     sock.settimeout(15)
     try:
         sock.sendall(b"\x05\x01\x00")
         if recv_exact(sock, 2) != b"\x05\x00":
-            raise OSError("本地 SOCKS 协商失败")
+            raise OSError("SOCKS 协商失败")
         name = host.encode("ascii")
         sock.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + (443).to_bytes(2, "big"))
         reply = recv_exact(sock, 4)
@@ -502,140 +515,101 @@ def verify_exit(port):
 
 def main():
     st.set_page_config(page_title="VPN Gate 节点优选", layout="wide")
-    try:
-        secret = str(st.secrets.get("SECRET_KEY", ""))
-    except (OSError, FileNotFoundError):
-        secret = ""
-    if not secret or secret == "your_secret_password_here":
-        st.error("请在 Streamlit Secrets 中设置非默认的 SECRET_KEY")
+    password = str(secret("SECRET_KEY", "") or "")
+    if not password or password == "your_secret_password_here":
+        st.error("请在 Streamlit App settings -> Secrets 设置非默认 SECRET_KEY")
         return
-    if not st.session_state.get("logged_in"):
-        st.title("VPN Gate 管理登录")
-        password = st.text_input("管理口令", type="password")
+    if not st.session_state.get("authenticated"):
+        st.title("管理登录")
+        attempt = st.text_input("管理口令", type="password")
         if st.button("登录"):
-            if hmac.compare_digest(password, secret):
-                st.session_state.logged_in = True
+            if hmac.compare_digest(attempt, password):
+                st.session_state.authenticated = True
                 st.rerun()
             else:
                 st.error("口令错误")
         return
     if st.sidebar.button("退出登录"):
-        st.session_state.logged_in = False
+        st.session_state.authenticated = False
         st.session_state.pop("candidates", None)
         st.rerun()
-    cfg = settings()
     st.title("VPN Gate OpenVPN 出站")
-    st.write("sing-box：", "运行中" if ours(get_pid(SB_PID), SB_BIN) else "未运行",
-             "；cloudflared：", "运行中" if ours(get_pid(CF_PID), CF_BIN) else "未运行")
-    st.subheader("拉取候选并优选")
-    st.caption("只筛选 CSV 中附带的 TCP OpenVPN 配置；从本容器测 TCP 连接延迟。"
-               "官网 Speed 是网站报告值，不是本机下载速度；测速不建立 VPN，也不会启动服务。")
+    try:
+        cfg = settings()
+    except Exception as exc:
+        st.error("Secrets 配置错误：" + str(exc))
+        return
+    mode = "固定域名" if cfg["token"] else "临时隧道（Secrets 中 Token 和域名均为空）"
+    st.caption(f"配置来自 Streamlit Secrets；当前入口模式：{mode}；仅手动启动服务。")
+    st.write("sing-box：", "运行中" if ours(pid(SB_PID), SB_BIN) else "未运行",
+             "；cloudflared：", "运行中" if ours(pid(CF_PID), CF_BIN) else "未运行")
+    st.subheader("VPN Gate 候选优选")
+    st.caption("仅自动筛选 TCP OpenVPN；本机测速仅是 TCP 建连延迟，官网 Speed 不等于本地下载速度。")
     col1, col2 = st.columns(2)
-    country = col1.selectbox("国家或地区", ["JP", "KR", "US", "全部"], index=0)
+    country = col1.selectbox("国家/地区", ["JP", "KR", "US", "全部"])
     limit = col2.slider("候选上限", 5, 40, 20, step=5)
-    if st.button("拉取并测试候选", type="primary"):
+    if st.button("拉取并测试候选"):
         try:
             with st.spinner("读取清单并测试 TCP 可达性..."):
-                candidates = benchmark(load_candidates(country, limit))
-            st.session_state["candidates"] = candidates
-            st.success(f"已检测 {len(candidates)} 个兼容候选；选择后仅保存配置，不启动")
+                found = benchmark(candidates(country, limit))
+            st.session_state.candidates = found
+            st.success(f"已测试 {len(found)} 个候选；选择并添加后仍需由你启动")
         except Exception as exc:
             st.session_state.pop("candidates", None)
-            st.error("拉取或测速失败：" + str(exc))
-    candidates = st.session_state.get("candidates", [])
-    if candidates:
-        display = []
-        for i, c in enumerate(candidates):
-            display.append({"序号": i + 1, "节点": c["host"], "国家": c["country"],
-                            "本机TCP连接延迟(ms)": c["latency"] if c["latency"] is not None else "不可达",
-                            "官网Speed(Mbps)": c["speed"], "官网Ping(ms)": c["ping"],
-                            "会话数": c["sessions"], "IP": c["ip"], "端口": c["port"]})
-        st.dataframe(display, use_container_width=True, hide_index=True)
-        choices = [i for i, c in enumerate(candidates) if c["latency"] is not None]
-        if choices:
-            selected = st.selectbox("选择节点（默认本机 TCP 延迟最低）", choices,
-                                    format_func=lambda i: f"{i + 1}. {candidates[i]['host']} "
-                                    f"{candidates[i]['country']} / {candidates[i]['latency']} ms / "
-                                    f"官网 {candidates[i]['speed']} Mbps")
-            if st.button("添加所选节点到当前 .ovpn（不启动）"):
-                chosen = candidates[selected]
-                ep, _ = parse_ovpn(chosen["profile"])
-                if ep["network"] != "tcp":
-                    st.error("所选配置不是 TCP")
-                else:
-                    write_private(PROFILE, chosen["profile"])
-                    st.success(f"已添加 {chosen['host']}；运行中的服务不受影响。准备好后由你点击启动/重启服务。")
-        else:
-            st.warning("没有可达 TCP 候选；可换地区或稍后重试")
-    st.divider()
-    st.subheader("当前落地配置")
-    upload = st.file_uploader("也可手动上传 VPN Gate .ovpn", type=["ovpn"])
-    if upload is not None and st.button("保存手动上传的 .ovpn"):
+            st.error("拉取或测试失败：" + str(exc))
+    found = st.session_state.get("candidates", [])
+    if found:
+        st.dataframe([{"序号": i + 1, "节点": c["host"], "国家": c["country"],
+                       "本机TCP延迟(ms)": c["latency"] if c["latency"] is not None else "不可达",
+                       "官网Speed(Mbps)": c["speed"], "官网Ping(ms)": c["ping"],
+                       "IP": c["ip"], "端口": c["port"]} for i, c in enumerate(found)],
+                     use_container_width=True, hide_index=True)
+        available = [i for i, c in enumerate(found) if c["latency"] is not None]
+        if available:
+            selected = st.selectbox("选择候选", available,
+                                    format_func=lambda i: f"{i + 1}. {found[i]['host']} / {found[i]['latency']} ms")
+            if st.button("添加所选节点（不启动）"):
+                write_private(PROFILE, found[selected]["profile"])
+                st.success("已保存 .ovpn；当前运行连接未切换。请由你点击启动/重启服务。")
+    upload = st.file_uploader("或手动上传 VPN Gate .ovpn", type=["ovpn"])
+    if upload is not None and st.button("保存上传的 .ovpn（不启动）"):
         try:
             text = upload.getvalue().decode("utf-8-sig")
-            ep, _ = parse_ovpn(text)
+            parse_ovpn(text)
             write_private(PROFILE, text)
-            st.success(f"已保存 {ep['server']}:{ep['server_port']} / {ep['network']}；未启动")
+            st.success("已保存 .ovpn；不会自动启动")
         except Exception as exc:
             st.error(".ovpn 不兼容：" + str(exc))
     if PROFILE.exists():
         try:
             ep, auth = parse_ovpn(PROFILE.read_text(encoding="utf-8"))
-            st.info(f"已保存：{ep['server']}:{ep['server_port']} / {ep['network']}；账号认证：{'需要' if auth else '配置未要求'}")
+            st.info(f"已保存落地：{ep['server']}:{ep['server_port']} / {ep['network']}；账号认证：{'需要' if auth else '配置未要求'}")
         except Exception as exc:
-            st.warning("已保存的配置无效：" + str(exc))
-    with st.form("settings_form"):
-        choices = ["vless", "vmess", "trojan"]
-        protocol = st.selectbox("入站协议", choices, index=choices.index(cfg["protocol"]) if cfg["protocol"] in choices else 0)
-        uid = st.text_input("UUID（留空自动生成）", cfg["uuid"])
-        pw = st.text_input("Trojan 密码", cfg["password"], type="password")
-        path = st.text_input("WebSocket 路径", cfg["ws_path"])
-        vpn_user = st.text_input("VPN 用户名", cfg["vpn_user"])
-        vpn_pass = st.text_input("VPN 密码", cfg["vpn_pass"], type="password")
-        domain = st.text_input("固定 Tunnel 域名（Token 模式必填）", cfg["domain"])
-        token = st.text_input("Tunnel Token（留空使用临时隧道）", cfg["tunnel_token"], type="password")
-        submitted = st.form_submit_button("保存配置")
-    if submitted:
-        try:
-            if uid.strip():
-                uuid.UUID(uid.strip())
-            cfg.update(protocol=protocol, uuid=uid.strip(), password=pw,
-                       ws_path="/" + path.strip().lstrip("/"), vpn_user=vpn_user.strip(),
-                       vpn_pass=vpn_pass, domain=domain.strip(), tunnel_token=token.strip())
-            write_private(SETTINGS, json.dumps(cfg, ensure_ascii=False, indent=2))
-            st.success("配置已保存；点击启动/重启服务后生效")
-        except Exception as exc:
-            st.error("保存失败：" + str(exc))
-    c1, c2, c3 = st.columns(3)
-    if c1.button("启动/重启服务", use_container_width=True):
+            st.warning("已保存 .ovpn 无效：" + str(exc))
+    a, b, c = st.columns(3)
+    if a.button("启动/重启服务", use_container_width=True):
         try:
             with st.spinner("检查配置并启动..."):
-                name = start(settings())
-            st.success("隧道域名：" + name)
-            st.info("进程启动不代表 VPN 握手成功，请点击验证实际出口")
+                domain = start(cfg)
+            st.success("隧道域名：" + domain)
+            st.info("服务启动不等于 VPN 出口成功，请点击验证实际出口")
         except Exception as exc:
             st.error("启动失败：" + str(exc))
-    if c2.button("验证实际出口", use_container_width=True):
+    if b.button("验证实际出口", use_container_width=True):
         try:
-            if not ours(get_pid(SB_PID), SB_BIN):
+            if not ours(pid(SB_PID), SB_BIN):
                 raise RuntimeError("sing-box 未运行")
-            data = verify_exit(settings()["test_port"])
+            data = verify_exit(cfg["test_port"])
             st.success(f"sing-box 出口 IP：{data['ip']}；地区代码：{data.get('country', '')}")
         except Exception as exc:
             st.error("验证失败：" + str(exc))
-            if "authentication failed" in log_text(SB_LOG).lower():
-                st.error("sing-box 日志显示 VPN 认证失败；请更换匹配的 .ovpn 或核对认证要求")
-    if c3.button("停止服务", use_container_width=True):
+    if c.button("停止服务", use_container_width=True):
         stop()
         st.info("已停止本项目记录的进程")
     if NODES.exists():
         st.subheader("节点链接")
         st.code(NODES.read_text(encoding="utf-8"))
-    with st.expander("诊断日志和备份"):
-        if PROFILE.exists():
-            st.download_button("导出 .ovpn（可能含私钥）", PROFILE.read_bytes(), file_name="vpngate.ovpn")
-        st.download_button("导出配置 JSON（含凭据）", json.dumps(settings(), ensure_ascii=False, indent=2),
-                           file_name="agsb-settings.json", mime="application/json")
+    with st.expander("诊断日志"):
         for path in (SB_LOG, CF_LOG):
             st.write(path.name)
             st.code(log_text(path)[-3500:] or "无日志")
