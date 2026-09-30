@@ -593,13 +593,13 @@ def verify_exit(port):
 
 
 def main():
-    st.set_page_config(page_title='VPN Gate 连接质量测试', layout='wide')
+    st.set_page_config(page_title='连接质量测试', layout='wide')
     password = str(secret('SECRET_KEY', '') or '')
     if not password or password == 'your_secret_password_here':
         st.error('请在 Streamlit App settings -> Secrets 设置非默认 SECRET_KEY')
         return
     if not st.session_state.get('authenticated'):
-        st.title('VPN Gate 管理登录')
+        st.title('管理登录')
         attempt = st.text_input('管理口令', type='password')
         if st.button('登录'):
             if hmac.compare_digest(attempt, password):
@@ -612,7 +612,7 @@ def main():
         st.session_state.authenticated = False
         st.session_state.pop('candidates', None)
         st.rerun()
-    st.title('VPN Gate 连接质量测试')
+    st.title('连接质量测试')
     try:
         cfg = settings()
     except Exception as exc:
