@@ -705,6 +705,11 @@ def main():
         for path in (SB_LOG, CF_LOG):
             st.write(path.name)
             st.code(log_text(path)[-3500:] or '无日志')
+render_speed_test(
+    st,
+    cfg["test_port"],
+    ours(get_pid(SB_PID), SB_BIN),
+)
 
 
 if __name__ == '__main__':
