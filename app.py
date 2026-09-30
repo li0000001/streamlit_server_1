@@ -622,6 +622,11 @@ def main():
     st.caption(f'配置优先读取 Streamlit Secrets；入口模式：{mode}。只有你点击启动时才切换正式服务。')
     st.write('sing-box：', '运行中' if ours(get_pid(SB_PID), SB_BIN) else '未运行',
              '；cloudflared：', '运行中' if ours(get_pid(CF_PID), CF_BIN) else '未运行')
+                  render_speed_test(
+        st,
+        cfg["test_port"],
+        ours(get_pid(SB_PID), SB_BIN),
+    )
     st.info('测试范围：Streamlit 容器到 VPN Gate 的 OpenVPN 握手。握手耗时不是 Mbps，也不包含客户端到 Cloudflare 或 VPN Gate 到网站。')
     col1, col2 = st.columns(2)
     country = col1.selectbox('国家/地区', ['JP', 'KR', 'US', '全部'])
@@ -705,11 +710,7 @@ def main():
         for path in (SB_LOG, CF_LOG):
             st.write(path.name)
             st.code(log_text(path)[-3500:] or '无日志')
-render_speed_test(
-    st,
-    cfg["test_port"],
-    ours(get_pid(SB_PID), SB_BIN),
-)
+
 
 
 if __name__ == '__main__':
